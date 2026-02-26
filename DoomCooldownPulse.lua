@@ -75,20 +75,61 @@ addon.animationFrame.TextFrame:SetTextColor(1,1,1)
 addon.animationTexture = addon.animationFrame:CreateTexture(nil, "BACKGROUND")
 addon.animationTexture:SetAllPoints(addon.animationFrame)
 
+addon.pulseFrames = {}
+
+local function GetPulseFrame()
+    for _, frame in ipairs(addon.pulseFrames) do
+        if not frame:IsShown() and not frame.animating then
+            return frame
+        end
+    end
+
+    local f = CreateFrame("Frame", nil, addon.animationFrame)
+    f:SetPoint("CENTER", addon.animationFrame, "CENTER", 0, 0)
+
+    f.text = f:CreateFontString(nil, "ARTWORK")
+    f.text:SetFont(STANDARD_TEXT_FONT, 14, "OUTLINE")
+    f.text:SetShadowOffset(2, -2)
+    f.text:SetPoint("CENTER", f, "CENTER")
+    f.text:SetWidth(185)
+    f.text:SetJustifyH("CENTER")
+    f.text:SetTextColor(1, 1, 1)
+
+    f.texture = f:CreateTexture(nil, "BACKGROUND")
+    f.texture:SetAllPoints(f)
+
+    table.insert(addon.pulseFrames, f)
+    return f
+end
+
 -- Pulse Animation (from Doom)
 function addon:PlayPulse(icon, isPet, spellName)
-    local f = addon.animationFrame
+    local f = GetPulseFrame()
     f:SetSize(addon:GetSetting("iconSize"), addon:GetSetting("iconSize"))
-    addon.animationTexture:SetTexture(icon)
+
+    -- Lightweight debug instrumentation
+    if addon.DCP_DEBUG == nil then addon.DCP_DEBUG = false end
+    addon._pulseCounter = addon._pulseCounter or 0
+    local texPath = icon
+    if type(icon) ~= "string" and icon then
+        local ok, t = pcall(function() return icon:GetTexture() end)
+        if ok and t then texPath = t end
+    end
+    if addon.DCP_DEBUG then
+        addon._pulseCounter = addon._pulseCounter + 1
+        print(string.format("[DCP] Pulse START: %s tex=%s time=%.3f concurrent=%d", tostring(spellName or "<nil>"), tostring(texPath or "<nil>"), GetTime(), addon._pulseCounter))
+    end
+
+    f.texture:SetTexture(icon)
     if isPet then
-        addon.animationTexture:SetVertexColor(unpack(addon:GetSetting("petOverlay")))
+        f.texture:SetVertexColor(unpack(addon:GetSetting("petOverlay")))
     else
-        addon.animationTexture:SetVertexColor(1, 1, 1)
+        f.texture:SetVertexColor(1, 1, 1)
     end
     if addon:GetSetting("showSpellName") and spellName then
-        f.TextFrame:SetText(spellName)
+        f.text:SetText(spellName)
     else
-        f.TextFrame:SetText(nil)
+        f.text:SetText(nil)
     end
     f:SetAlpha(0)
     f:Show()
@@ -101,15 +142,21 @@ function addon:PlayPulse(icon, isPet, spellName)
     local iconSize = addon:GetSetting("iconSize")
 
     local elapsed = 0
+    f.animating = true
     f:SetScript("OnUpdate", function(self, delta)
         elapsed = elapsed + delta
         local totalTime = fadeInTime + holdTime + fadeOutTime
         if elapsed >= totalTime then
             f:Hide()
             f:SetScript("OnUpdate", nil)
-            f.TextFrame:SetText(nil)
-            addon.animationTexture:SetTexture(nil)
-            addon.animationTexture:SetVertexColor(1, 1, 1)
+            f.text:SetText(nil)
+            f.texture:SetTexture(nil)
+            f.texture:SetVertexColor(1, 1, 1)
+            f.animating = false
+            if addon.DCP_DEBUG then
+                addon._pulseCounter = math.max(0, (addon._pulseCounter or 1) - 1)
+                print(string.format("[DCP] Pulse END: %s time=%.3f concurrent=%d", tostring(spellName or "<nil>"), GetTime(), addon._pulseCounter))
+            end
             return
         end
 
@@ -181,9 +228,13 @@ function addon:ScanSpellbook(silent)
                     local realSpellID = overrideID or spellID
 
                     if realSpellID and not slotInfo.isPassive then
-                        local duration, gcd = GetSpellBaseCooldown(realSpellID)
-
-                        if not duration or duration == 0 then
+                        -- Prefer base cooldown so we can filter short CDs in combat
+                        local duration = 0
+                        local baseDuration = GetSpellBaseCooldown(realSpellID)
+                        if baseDuration and baseDuration > 0 then
+                            duration = baseDuration
+                        else
+                            -- Fallback to current cooldown if base isn't available
                             local cdInfo = C_Spell.GetSpellCooldown(realSpellID)
                             if cdInfo and SafeCompare(cdInfo.duration, 0) then
                                 duration = cdInfo.duration * 1000
@@ -211,35 +262,27 @@ function addon:ScanSpellbook(silent)
     for i = 1, NUM_PET_ACTION_SLOTS or 10 do
         local name, texture, isToken, isActive, autoCastAllowed, autoCastEnabled = GetPetActionInfo(i)
         if name and texture then
-            local spellID = select(7, GetSpellInfo(name)) -- Approximate
-            if spellID then
-                addon.trackedSpells["pet:" .. i] = {
-                    id = i,
-                    type = "pet",
-                    name = name,
-                    texture = texture
-                }
-            end
+            -- Pet actions are tracked by index, not spell ID
+            addon.trackedSpells["pet:" .. i] = {
+                id = i,
+                type = "pet",
+                name = name,
+                texture = texture
+            }
         end
     end
 
     local count = 0
     for _ in pairs(addon.trackedSpells) do count = count + 1 end
 
-    if not silent then
-        print("|cff00ff7fDoom Cooldown Pulse|r: Initialized with " .. count .. " cooldowns.")
-    end
+    -- silent initialization (no debug output)
 
     return count
 end
 
 -- Track Item Spell (from Doom)
+-- Note: This function is not actively used. Item cooldowns are tracked via trinket slot scanning.
 function addon:TrackItemSpell(itemID)
-    local _, spellID = GetItemSpell(itemID)
-    if spellID then
-        addon.itemSpells[spellID] = itemID
-        return true
-    end
     return false
 end
 
@@ -258,6 +301,7 @@ local function ProcessSpell(spellID, data)
             if SafeCompare(chargeInfo.cooldownDuration, 1.9) then
                 local f = addon:GetTrackerFrame()
                 f:SetCooldown(chargeInfo.cooldownStartTime, chargeInfo.cooldownDuration)
+                -- Only track if frame is actually shown (SetCooldown may fail during combat)
                 if f:IsShown() then
                     addon.activeTrackers[spellID] = f
                     f:SetScript("OnCooldownDone", function()
@@ -270,20 +314,20 @@ local function ProcessSpell(spellID, data)
             end
         end
     else
-        if cooldownInfo and SafeCompare(cooldownInfo.startTime, 0) and not isOnGCD then
-            if (data.baseCD or 0) >= 2000 and SafeCompare(cooldownInfo.duration, 1.9) then
-                local f = addon:GetTrackerFrame()
-                f:SetCooldown(cooldownInfo.startTime, cooldownInfo.duration)
-                if f:IsShown() then
-                    addon.activeTrackers[spellID] = f
-                    f:SetScript("OnCooldownDone", function()
-                        addon:PlayPulse(icon, false, C_Spell.GetSpellName(spellID))
-                        addon:ReleaseTrackerFrame(spellID)
-                    end)
-                else
-                    table.insert(addon.trackerPool, f)
-                end
-            end
+        if not cooldownInfo then return end
+        if isOnGCD then return end
+        if not SafeCompare(cooldownInfo.startTime, 0) then return end
+        if not SafeCompare(cooldownInfo.duration, 1.9) then return end
+        local f = addon:GetTrackerFrame()
+        f:SetCooldown(cooldownInfo.startTime, cooldownInfo.duration)
+        if f:IsShown() then
+            addon.activeTrackers[spellID] = f
+            f:SetScript("OnCooldownDone", function()
+                addon:PlayPulse(icon, false, C_Spell.GetSpellName(spellID))
+                addon:ReleaseTrackerFrame(spellID)
+            end)
+        else
+            table.insert(addon.trackerPool, f)
         end
     end
 end
@@ -294,15 +338,22 @@ local function ProcessTrinket(slotID)
     if DoomCooldownPulseDB and DoomCooldownPulseDB[key] then return end
     if addon.activeTrackers[key] then return end
 
-    local startTime, duration, enable = C_Item.GetItemCooldown(GetInventoryItemID("player", slotID))
+    -- Use ItemLocation API instead of protected GetInventoryItemID
+    local itemLocation = ItemLocation:CreateFromEquipmentSlot(slotID)
+    local itemID = C_Item.GetItemID(itemLocation)
+    if not itemID then return end
+    
+    local startTime, duration, enable = C_Item.GetItemCooldown(itemID)
     if SafeCompare(startTime, 0) and SafeCompare(duration, 1.9) then
         local f = addon:GetTrackerFrame()
         f:SetCooldown(startTime, duration)
+        -- Only track if frame is actually shown (SetCooldown may fail during combat)
         if f:IsShown() then
-            local icon = GetInventoryItemTexture("player", slotID)
+            local icon = C_Item.GetItemIconByID(itemID)
             addon.activeTrackers[key] = f
             f:SetScript("OnCooldownDone", function()
-                addon:PlayPulse(icon, false, GetInventoryItemLink("player", slotID))
+                local itemLink = C_Item.GetItemLink(itemLocation)
+                addon:PlayPulse(icon, false, itemLink)
                 addon:ReleaseTrackerFrame(key)
             end)
         else
@@ -321,6 +372,7 @@ local function ProcessPet(index)
     if SafeCompare(start, 0) and SafeCompare(duration, 1.9) then
         local f = addon:GetTrackerFrame()
         f:SetCooldown(start, duration)
+        -- Only track if frame is actually shown (SetCooldown may fail during combat)
         if f:IsShown() then
             addon.activeTrackers[key] = f
             f:SetScript("OnCooldownDone", function()
@@ -332,12 +384,12 @@ local function ProcessPet(index)
         end
     end
 end
-
 -- Event Handler
 local eventFrame = CreateFrame("Frame")
 eventFrame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
     if event == "ADDON_LOADED" and arg1 == "DoomCooldownPulse" then
         DoomCooldownPulseDB = DoomCooldownPulseDB or {}
+        DoomCooldownPulseDB.settings = DoomCooldownPulseDB.settings or {}
         DoomCooldownPulseDBPerCharacter = DoomCooldownPulseDBPerCharacter or {}
         -- Merge defaults
         for k, v in pairs(addon.defaults) do
@@ -362,7 +414,12 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
         else
             for spellID, data in pairs(addon.trackedSpells) do
                 if type(spellID) == "number" then
-                    ProcessSpell(spellID, data)
+                    local success, err = pcall(function()
+                        ProcessSpell(spellID, data)
+                    end)
+                    if not success then
+                        -- swallow errors during scan to avoid spam
+                    end
                 end
             end
         end
@@ -380,18 +437,19 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
         end
     elseif event == "PLAYER_EQUIPMENT_CHANGED" then
         -- Force check
-    elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
-        local _, subEvent, _, _, _, sourceFlags, _, _, _, _, _, spellID = CombatLogGetCurrentEventInfo()
-        if subEvent == "SPELL_CAST_SUCCESS" and bit.band(sourceFlags, COMBATLOG_OBJECT_TYPE_PET) == COMBATLOG_OBJECT_TYPE_PET and bit.band(sourceFlags, COMBATLOG_OBJECT_AFFILIATION_MINE) == COMBATLOG_OBJECT_AFFILIATION_MINE then
-            local name = C_Spell.GetSpellName(spellID)
-            for i = 1, NUM_PET_ACTION_SLOTS or 10 do
-                local petName = GetPetActionInfo(i)
-                if petName == name then
-                    ProcessPet(i)
-                    break
-                end
-            end
-        end
+    -- DISABLED in Midnight: COMBAT_LOG_EVENT_UNFILTERED handler removed (see event registration)
+    -- elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
+    --     local _, subEvent, _, _, _, sourceFlags, _, _, _, _, _, spellID = CombatLogGetCurrentEventInfo()
+    --     if subEvent == "SPELL_CAST_SUCCESS" and bit.band(sourceFlags, COMBATLOG_OBJECT_TYPE_PET) == COMBATLOG_OBJECT_TYPE_PET and bit.band(sourceFlags, COMBATLOG_OBJECT_AFFILIATION_MINE) == COMBATLOG_OBJECT_AFFILIATION_MINE then
+    --         local name = C_Spell.GetSpellName(spellID)
+    --         for i = 1, NUM_PET_ACTION_SLOTS or 10 do
+    --             local petName = GetPetActionInfo(i)
+    --             if petName == name then
+    --                 ProcessPet(i)
+    --                 break
+    --             end
+    --         end
+    --     end
     end
 end)
 
@@ -402,23 +460,13 @@ eventFrame:RegisterEvent("SPELLS_CHANGED")
 eventFrame:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 eventFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 eventFrame:RegisterEvent("ACTIONBAR_UPDATE_COOLDOWN")
-eventFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+-- DISABLED in Midnight: COMBAT_LOG_EVENT_UNFILTERED has heavy security restrictions
+-- Pet cooldowns are tracked via ProcessPet in the SPELL_UPDATE_COOLDOWN handler instead
+-- eventFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 
--- Hooks (from Doom)
-hooksecurefunc("UseAction", function(slot)
-    local actionType, itemID = GetActionInfo(slot)
-    if actionType == "item" and not addon:TrackItemSpell(itemID) then
-        local texture = GetActionTexture(slot)
-        -- Trigger immediate check
-    end
-end)
-
-hooksecurefunc("UseInventoryItem", function(slot)
-    local itemID = GetInventoryItemID("player", slot)
-    if itemID and not addon:TrackItemSpell(itemID) then
-        -- Trigger
-    end
-end)
+-- Removed hooksecurefunc on UseAction and UseInventoryItem
+-- These hooks were causing taint issues when trying to access protected inventory APIs
+-- Item cooldown tracking is already handled by trinket slot scanning in SPELL_UPDATE_COOLDOWN event
 
 -- Slash Command
 SLASH_DOOMCOOLDOWNPULSE1 = "/DoomCooldownPulse"
@@ -581,8 +629,9 @@ function addon:CreateOptionsFrame()
 
     local ignoretypebuttonblacklist = CreateFrame("Checkbutton","DoomCooldownPulse_OptionsFrameIgnoreTypeButtonBlacklist",optionsframe,"UIRadioButtonTemplate")
     ignoretypebuttonblacklist:SetPoint("TOPLEFT",ignoretext,"BOTTOMLEFT",0,-4)
-    ignoretypebuttonblacklist:SetChecked(not DoomCooldownPulseDBPerCharacter.invertIgnored)
+    ignoretypebuttonblacklist:SetChecked(DoomCooldownPulseDBPerCharacter and not DoomCooldownPulseDBPerCharacter.invertIgnored or false)
     ignoretypebuttonblacklist:SetScript("OnClick", function()
+        DoomCooldownPulseDBPerCharacter = DoomCooldownPulseDBPerCharacter or {}
         DoomCooldownPulse_OptionsFrameIgnoreTypeButtonWhitelist:SetChecked(false)
         DoomCooldownPulseDBPerCharacter.invertIgnored = false
     end)
@@ -593,8 +642,9 @@ function addon:CreateOptionsFrame()
 
     local ignoretypebuttonwhitelist = CreateFrame("Checkbutton","DoomCooldownPulse_OptionsFrameIgnoreTypeButtonWhitelist",optionsframe,"UIRadioButtonTemplate")
     ignoretypebuttonwhitelist:SetPoint("LEFT",ignoretypetextblacklist,"RIGHT",10,0)
-    ignoretypebuttonwhitelist:SetChecked(DoomCooldownPulseDBPerCharacter.invertIgnored)
+    ignoretypebuttonwhitelist:SetChecked(DoomCooldownPulseDBPerCharacter and DoomCooldownPulseDBPerCharacter.invertIgnored or false)
     ignoretypebuttonwhitelist:SetScript("OnClick", function()
+        DoomCooldownPulseDBPerCharacter = DoomCooldownPulseDBPerCharacter or {}
         DoomCooldownPulse_OptionsFrameIgnoreTypeButtonBlacklist:SetChecked(false)
         DoomCooldownPulseDBPerCharacter.invertIgnored = true
     end)
@@ -608,11 +658,12 @@ function addon:CreateOptionsFrame()
     ignorebox:SetPoint("TOPLEFT",ignoretypebuttonblacklist,"BOTTOMLEFT",4,2)
     ignorebox:SetWidth(170)
     ignorebox:SetHeight(32)
-    ignorebox:SetText(DoomCooldownPulseDBPerCharacter.ignoredSpells)
+    ignorebox:SetText(DoomCooldownPulseDBPerCharacter and DoomCooldownPulseDBPerCharacter.ignoredSpells or "")
     ignorebox:SetScript("OnEnter",function(self) GameTooltip:SetOwner(self, "ANCHOR_CURSOR") GameTooltip:SetText("Note: Separate multiple spells with commas") end)
     ignorebox:SetScript("OnLeave",function(self) GameTooltip:Hide() end)
     ignorebox:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
     ignorebox:SetScript("OnEditFocusLost",function(self)
+        DoomCooldownPulseDBPerCharacter = DoomCooldownPulseDBPerCharacter or {}
         DoomCooldownPulseDBPerCharacter.ignoredSpells = ignorebox:GetText()
     end)
 
@@ -631,4 +682,11 @@ end
 -- Test Pulse
 function addon:TestPulse()
     addon:PlayPulse("Interface\\Icons\\Spell_Nature_Earthbind", false, "Test Spell")
+end
+
+-- Slash command to toggle debug logging
+SLASH_DCPDEBUG1 = "/dcpdebug"
+SlashCmdList["DCPDEBUG"] = function(msg)
+    addon.DCP_DEBUG = not addon.DCP_DEBUG
+    print("DoomCooldownPulse debug: " .. (addon.DCP_DEBUG and "ON" or "OFF"))
 end
